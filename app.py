@@ -1,16 +1,29 @@
-import streamlit as st
-import copy
 import os
+import tempfile
+import copy
+import streamlit as st
 
+# --- Load GCP service account JSON from Streamlit secrets ---
+if "GCP_SA_JSON" in st.secrets:
+    sa_path = "/tmp/gcp_service_account.json"
+    with open(sa_path, "w") as f:
+        f.write(st.secrets["GCP_SA_JSON"])
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+
+# Now safe to import backend
 from main_backend import (
     call_vertex, generate_title, generate_outline_from_desc,
     generate_ppt_from_outline, generate_doc_from_outline,
-    generate_single_image, summarize_long_text, extract_text
+    generate_single_image, summarize_long_text, extract_text,
+    clean_generated_files
 )
 
 # ---------------- Streamlit Config ----------------
 st.set_page_config(page_title="AI Productivity Suite", layout="wide")
 st.title("AI Productivity Suite")
+
+# Clean up old files
+clean_generated_files(max_age_hours=1)
 
 # ---------------- Helpers ----------------
 def render_outline_preview(outline_data, mode="ppt"):
@@ -29,6 +42,7 @@ def render_outline_preview(outline_data, mode="ppt"):
             st.markdown(item_desc.replace("\n", "\n\n"))
     return len(items) > 0
 
+
 # ---------------- Session State ----------------
 defaults = {
     "messages": [],
@@ -45,10 +59,12 @@ for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
+
 # ---------------- Chat History ----------------
 for role, content in st.session_state.messages:
     with st.chat_message(role):
         st.markdown(content)
+
 
 # ---------------- General Chat ----------------
 if prompt := st.chat_input("Type a message, ask for a PPT, DOC, or Image ..."):
@@ -93,6 +109,7 @@ if prompt := st.chat_input("Type a message, ask for a PPT, DOC, or Image ..."):
 
     st.rerun()
 
+
 # ---------------- Outline Preview + Actions ----------------
 if st.session_state.outline_chat:
     mode = st.session_state.outline_mode
@@ -134,6 +151,7 @@ if st.session_state.outline_chat:
                 except Exception as e:
                     st.error(f"❌ Generation error: {e}")
 
+
 # ---------------- Document Upload ----------------
 uploaded_file = st.file_uploader("📂 Upload a document", type=["pdf", "docx", "txt", "md"])
 
@@ -152,6 +170,7 @@ if uploaded_file is not None:
             st.success(f"✅ Document uploaded! Suggested Title: **{st.session_state.summary_title}**")
         else:
             st.error("❌ Unsupported or empty file.")
+
 
 # ---------------- Chat with Document ----------------
 if st.session_state.summary_text:
