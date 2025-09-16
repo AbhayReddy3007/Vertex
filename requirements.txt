@@ -1,0 +1,18 @@
+# Core app
+streamlit
+pillow
+
+# Document & PPT generation
+python-pptx
+python-docx
+
+# PDF/Text parsing
+pymupdf
+lxml
+
+# Google Cloud (Vertex AI)
+google-cloud-aiplatform
+
+# Utilities
+requests
+protobuf
