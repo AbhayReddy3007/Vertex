@@ -1,496 +1,185 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-import os, re, datetime, tempfile, fitz, docx, base64
+This is my ppt_generator.py
+from pptx import Presentation
+from pptx.util import Pt, Inches
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
+import re
+from PIL import Image
+import os
 
-from ppt_generator import create_ppt
-from doc_generator import create_doc
+def clean_title_text(title: str) -> str:
+    """Clean up titles for slides."""
+    if not title:
+        return "Presentation"
+    title = re.sub(r"\s+", " ", title.strip())  # collapse multiple spaces/newlines
+    return title
 
-import vertexai
-from vertexai.generative_models import GenerativeModel
-from vertexai.preview.vision_models import ImageGenerationModel
-
-# ---------------- CONFIG ----------------
-PROJECT_ID = "drl-zenai-prod"  
-REGION = "us-central1"
-
-vertexai.init(project=PROJECT_ID, location=REGION)
-
-TEXT_MODEL_NAME = "gemini-1.5-flash"
-TEXT_MODEL = GenerativeModel(TEXT_MODEL_NAME)
-
-IMAGE_MODEL_NAME = "imagen-3.0-generate-002"  
-IMAGE_MODEL = ImageGenerationModel.from_pretrained(IMAGE_MODEL_NAME)
-
-# ---------------- FASTAPI ----------------
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------- MODELS ----------------
-class ChatRequest(BaseModel):
-    message: str
-
-class ChatDocRequest(BaseModel):
-    message: str
-    document_text: str
-
-class Slide(BaseModel):
-    title: str
-    description: str
-
-class Section(BaseModel):
-    title: str
-    description: str
-
-class Outline(BaseModel):
-    title: str
-    slides: List[Slide]
-
-class DocOutline(BaseModel):
-    title: str
-    sections: List[Section]
-
-class EditRequest(BaseModel):
-    outline: Outline
-    feedback: str
-
-class EditDocRequest(BaseModel):
-    outline: DocOutline
-    feedback: str
-
-class GeneratePPTRequest(BaseModel):
-    description: str = ""
-    outline: Optional[Outline] = None
-
-class GenerateDocRequest(BaseModel):
-    description: str = ""
-    outline: Optional[DocOutline] = None
-
-class ImageRequest(BaseModel):
-    prompt: str
-
-
-# ---------------- HELPERS ----------------
-def extract_slide_count(description: str, default: Optional[int] = None) -> Optional[int]:
-    m = re.search(r"(\d+)\s*(slides?|sections?|pages?)", description, re.IGNORECASE)
-    if m:
-        total = int(m.group(1))
-        return max(1, total - 1)
-    return None if default is None else default - 1
-
-def call_vertex(prompt: str) -> str:
+def resize_image(image_path, max_width=800, max_height=600):
+    """Resize image to fit inside max_width × max_height (in pixels)."""
     try:
-        response = TEXT_MODEL.generate_content(prompt)
-        return response.text.strip()
+        img = Image.open(image_path)
+        img.thumbnail((max_width, max_height))  # maintain aspect ratio
+        resized_path = image_path.replace(".png", "_resized.png")
+        img.save(resized_path, "PNG")
+        return resized_path
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Vertex AI text generation error: {e}")
+        print(f"⚠️ Could not resize image {image_path}: {e}")
+        return image_path
 
-def generate_title(summary: str) -> str:
-    prompt = f"""Read the following summary and create a short, clear, presentation-style title.
-- Keep it under 10 words
-- Do not include birth dates, long sentences, or excessive details
-- Just give a clean title, like a presentation heading
+def create_ppt(title, points, filename="output.pptx", images=None):
+    prs = Presentation()
 
-Summary:
-{summary}
-"""
-    return call_vertex(prompt).strip()
+    # --- Brand Colors ---
+    PRIMARY_PURPLE = RGBColor(94, 42, 132)   # #5E2A84
+    SECONDARY_TEAL = RGBColor(0, 185, 163)   # #00B9A3
+    TEXT_DARK = RGBColor(40, 40, 40)         # dark gray
+    BG_LIGHT = RGBColor(244, 244, 244)       # light gray
 
-def parse_points(points_text: str):
-    points = []
-    current_title, current_content = None, []
-    lines = [re.sub(r"[#*>`]", "", ln).rstrip() for ln in points_text.splitlines()]
+    # Clean the title
+    title = clean_title_text(title)
 
-    for line in lines:
-        if not line or "Would you like" in line:
-            continue
-        m = re.match(r"^\s*(Slide|Section)\s*(\d+)\s*:\s*(.+)$", line, re.IGNORECASE)
-        if m:
-            if current_title:
-                points.append({"title": current_title, "description": "\n".join(current_content)})
-            current_title, current_content = m.group(3).strip(), []
-            continue
-        if line.strip().startswith("-"):
-            text = line.lstrip("-").strip()
-            if text:
-                current_content.append(f"• {text}")
-        elif line.strip().startswith(("•", "*")) or line.startswith("  "):
-            text = line.lstrip("•*").strip()
-            if text:
-                current_content.append(f"- {text}")
-        else:
-            if line.strip():
-                current_content.append(line.strip())
+    # --- Title Slide ---
+    slide_layout = prs.slide_layouts[5]  # blank layout
+    slide = prs.slides.add_slide(slide_layout)
 
-    if current_title:
-        points.append({"title": current_title, "description": "\n".join(current_content)})
-    return points
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = PRIMARY_PURPLE
 
-def extract_text(path: str, filename: str) -> str:
-    name = filename.lower()
-    if name.endswith(".pdf"):
-        text_parts: List[str] = []
-        doc = fitz.open(path)
-        try:
-            for page in doc:
-                text_parts.append(page.get_text("text"))
-        finally:
-            doc.close()
-        return "\n".join(text_parts)
-    if name.endswith(".docx"):
-        d = docx.Document(path)
-        return "\n".join(p.text for p in d.paragraphs)
-    if name.endswith(".txt"):
-        for enc in ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
-            try:
-                with open(path, "r", encoding=enc) as f:
-                    return f.read()
-            except UnicodeDecodeError:
-                continue
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    return ""
+    # Title TextBox
+    left, top, width, height = Inches(1), Inches(2), Inches(8), Inches(3)
+    textbox = slide.shapes.add_textbox(left, top, width, height)
+    tf = textbox.text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    tf.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
 
-def split_text(text: str, chunk_size: int = 8000, overlap: int = 300) -> List[str]:
-    if not text:
-        return []
-    chunks: List[str] = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunks.append(text[start:end])
-        if end == n:
-            break
-        start = max(0, end - overlap)
-    return chunks
+    p = tf.add_paragraph()
+    p.text = title
+    p.font.size = Pt(40)
+    p.font.bold = True
+    p.font.color.rgb = RGBColor(255, 255, 255)
+    p.alignment = PP_ALIGN.CENTER
 
-def generate_outline_from_desc(description: str, num_items: Optional[int], mode: str = "ppt"):
-    if num_items:
-        if mode == "ppt":
-            prompt = f"""Create a PowerPoint outline on: {description}.
-Generate exactly {num_items} content slides (⚠️ excluding the title slide).
-Do NOT include a title slide — I will handle it separately.
-Start from Slide 1 as the first *content slide*.
-Format strictly like this:
-Slide 1: <Title>
-- Bullet
-- Bullet
-- Bullet
-"""
-        else:
-            prompt = f"""Create a detailed Document outline on: {description}.
-Generate exactly {num_items} sections (treat each section as roughly one page).
-Each section should have:
-- A section title
-- 2–3 descriptive paragraphs (5–7 sentences each).
-Do NOT use bullet points.
-Format strictly like this:
-Section 1: <Title>
-<Paragraph 1>
-<Paragraph 2>
-<Paragraph 3>
-"""
-    else:
-        if mode == "ppt":
-            prompt = f"""Create a PowerPoint outline on: {description}.
-Decide the most appropriate number of content slides (⚠️ excluding the title slide).
-Each slide should have a short title and 3–5 bullet points.
-Do NOT include a title slide — I will handle it separately.
-Format strictly like this:
-Slide 1: <Title>
-- Bullet
-- Bullet
-- Bullet
-"""
-        else:
-            prompt = f"""Create a detailed Document outline on: {description}.
-Decide the most appropriate number of sections (treat each section as roughly one page).
-Each section should have:
-- A section title
-- 2–3 descriptive paragraphs (5–7 sentences each).
-Do NOT use bullet points.
-Format strictly like this:
-Section 1: <Title>
-<Paragraphs...>
-"""
-    points_text = call_vertex(prompt)
-    return parse_points(points_text)
-
-def summarize_long_text(full_text: str) -> str:
-    chunks = split_text(full_text)
-    if len(chunks) <= 1:
-        return call_vertex(f"Summarize the following text in detail:\n\n{full_text}")
-    partial_summaries = []
-    for idx, ch in enumerate(chunks, start=1):
-        mapped = call_vertex(f"Summarize this part of a longer document:\n\n{ch}")
-        partial_summaries.append(f"Chunk {idx}:\n{mapped.strip()}")
-    combined = "\n\n".join(partial_summaries)
-    return call_vertex(f"Combine these summaries into one clean, well-structured summary:\n\n{combined}")
-
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[^A-Za-z0-9_.-]', '_', name)
-
-def clean_title(title: str) -> str:
-    return re.sub(r"\s*\(.*?\)", "", title).strip()
-
-def save_temp_image(image_bytes, idx, title):
-    output_dir = os.path.join(os.path.dirname(__file__), "generated_files", "images")
-    os.makedirs(output_dir, exist_ok=True)
-    safe_title = re.sub(r'[^A-Za-z0-9_.-]', '_', title)[:30]
-    filename = f"{safe_title}_{idx}.png"
-    filepath = os.path.join(output_dir, filename)
-    with open(filepath, "wb") as f:
-        f.write(image_bytes)
-    return filepath
-
-def should_generate_image(title: str, description: str) -> bool:
-    """
-    Ask Gemini if an image is needed for this slide/section.
-    """
-    prompt = f"""
-    You are helping to decide if a slide/section in a presentation/document needs an image.
-    Slide/Section Title: {title}
-    Content: {description}
-
-    Answer with only "YES" if an image/visual would significantly enhance understanding,
-    or "NO" if it does not add much value.
-    """
-    try:
-        decision = call_vertex(prompt).strip().upper()
-        return decision.startswith("Y")
-    except:
-        return False
-
-def generate_images_for_points(points, mode="ppt"):
-    """Generate images only for slides/sections where it's useful."""
-    images = []
+    # --- Content Slides ---
     for idx, item in enumerate(points, start=1):
-        if should_generate_image(item['title'], item['description']):
-            img_prompt = (
-                f"An illustration for a {mode.upper()} section titled '{item['title']}'. "
-                f"Content: {item['description']}. "
-                f"Style: professional, modern, clean, infographic look."
-            )
+        key_point = clean_title_text(item.get("title", ""))
+        description = item.get("description", "")
+
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+
+        # Alternate background
+        bg_color = BG_LIGHT if idx % 2 == 0 else RGBColor(255, 255, 255)
+        fill = slide.background.fill
+        fill.solid()
+        fill.fore_color.rgb = bg_color
+
+        # Slide Title
+        left, top, width, height = Inches(0.8), Inches(0.5), Inches(8), Inches(1.5)
+        textbox = slide.shapes.add_textbox(left, top, width, height)
+        tf = textbox.text_frame
+        tf.word_wrap = True
+        tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        tf.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
+
+        p = tf.add_paragraph()
+        p.text = key_point
+        p.font.size = Pt(30)
+        p.font.bold = True
+        p.font.color.rgb = PRIMARY_PURPLE
+        p.alignment = PP_ALIGN.LEFT
+
+        # Accent underline
+        shape = slide.shapes.add_shape(
+            1, Inches(0.8), Inches(1.6), Inches(3), Inches(0.1)
+        )
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = SECONDARY_TEAL
+        shape.line.fill.background()
+
+        # Description bullets
+        if description:
+            left, top, width, height = Inches(1), Inches(2.2), Inches(5), Inches(4)
+            textbox = slide.shapes.add_textbox(left, top, width, height)
+            tf = textbox.text_frame
+            tf.word_wrap = True
+            for line in description.split("\n"):
+                if line.strip():
+                    bullet = tf.add_paragraph()
+                    bullet.text = line.strip()
+                    bullet.font.size = Pt(22)
+                    bullet.font.color.rgb = TEXT_DARK
+                    bullet.level = 0
+
+        # Add image (if available)
+        if images and idx - 1 < len(images) and images[idx - 1]:
             try:
-                resp = IMAGE_MODEL.generate_images(prompt=img_prompt, number_of_images=1)
-                if resp.images and hasattr(resp.images[0], "_image_bytes"):
-                    img_bytes = resp.images[0]._image_bytes
-                else:
-                    img_bytes = None
-
-                if img_bytes:
-                    img_path = save_temp_image(img_bytes, idx, item["title"])
-                    images.append(img_path)
-                else:
-                    images.append(None)
+                img_path = resize_image(images[idx - 1], max_width=800, max_height=600)
+                slide.shapes.add_picture(img_path, Inches(6), Inches(2.2), Inches(3.5), Inches(3))
             except Exception as e:
-                print(f"⚠️ Image generation failed for {mode} {idx}: {e}")
-                images.append(None)
-        else:
-            images.append(None)
-    return images
+                print(f"⚠️ Could not add image to slide {idx}: {e}")
+
+    prs.save(filename)
+    return filename
 
 
-# ---------------- ROUTES ----------------
-@app.post("/chat")
-def chat(req: ChatRequest):
-    reply = call_vertex(req.message)
-    return {"response": reply}
+This is my doc_generator.py
+from docx import Document
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+import re, os
 
-@app.post("/upload/")
-async def upload(file: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-    try:
-        text = extract_text(tmp_path, file.filename)
-    finally:
-        try: os.remove(tmp_path)
-        except Exception: pass
-    if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="Unsupported, empty, or unreadable file content.")
-    try:
-        summary = summarize_long_text(text)
-        title = generate_title(summary) or os.path.splitext(file.filename)[0]
-        return {
-            "filename": file.filename,
-            "chars": len(text),
-            "chunks": len(split_text(text)),
-            "title": title,
-            "summary": summary,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Summarization failed: {e}")
+def clean_title_text(title: str) -> str:
+    """Clean up titles for document sections."""
+    if not title:
+        return "Document"
+    title = re.sub(r"\s+", " ", title.strip())
+    return title
 
-@app.post("/generate-ppt-outline")
-def generate_ppt_outline(request: GeneratePPTRequest):
-    title = generate_title(request.description)
-    num_content_slides = extract_slide_count(request.description, default=None)
-    points = generate_outline_from_desc(request.description, num_content_slides, mode="ppt")
-    return {"title": title, "slides": points}
 
-@app.post("/generate-ppt")
-def generate_ppt(req: GeneratePPTRequest):
-    if req.outline:
-        title = clean_title(req.outline.title) or "Presentation"
-        points = [{"title": clean_title(s.title), "description": s.description} for s in req.outline.slides]
-    else:
-        title = clean_title(generate_title(req.description))
-        num_content_slides = extract_slide_count(req.description, default=None)
-        points = generate_outline_from_desc(req.description, num_content_slides, mode="ppt")
-
-    images = generate_images_for_points(points, mode="ppt")
-
-    output_dir = os.path.join(os.path.dirname(__file__), "generated_files")
-    os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"{sanitize_filename(title)}.pptx")
-
-    create_ppt(title, points, filename=filename, images=images)
-
-    return FileResponse(filename,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        filename=os.path.basename(filename)
-    )
-
-@app.post("/generate-doc-outline")
-def generate_doc_outline(request: GenerateDocRequest):
-    title = generate_title(request.description)
-    num_sections = extract_slide_count(request.description, default=None)
-    points = generate_outline_from_desc(request.description, num_sections, mode="doc")
-    return {"title": title, "sections": points}
-
-@app.post("/generate-doc")
-def generate_doc(req: GenerateDocRequest):
-    if req.outline:
-        title = clean_title(req.outline.title) or "Document"
-        points = [{"title": clean_title(s.title), "description": s.description} for s in req.outline.sections]
-    else:
-        title = clean_title(generate_title(req.description))
-        num_sections = extract_slide_count(req.description, default=None)
-        points = generate_outline_from_desc(req.description, num_sections, mode="doc")
-
-    images = generate_images_for_points(points, mode="doc")
-
-    output_dir = os.path.join(os.path.dirname(__file__), "generated_files")
-    os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"{sanitize_filename(title)}.docx")
-
-    create_doc(title, points, filename=filename, images=images)
-
-    return FileResponse(filename,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=os.path.basename(filename)
-    )
-
-@app.post("/chat-doc")
-def chat_with_doc(req: ChatDocRequest):
-    prompt = f"""
-    You are an assistant answering based only on the provided document.
-    Document:
-    {req.document_text}
-
-    Question:
-    {req.message}
-
-    Answer clearly and concisely using only the document content.
+def create_doc(title, sections, filename="output.docx", images=None):
     """
-    try:
-        reply = call_vertex(prompt)
-        return {"response": reply}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat-with-doc failed: {e}")
-
-@app.post("/generate-image")
-def generate_image(req: ImageRequest):
-    try:
-        resp = IMAGE_MODEL.generate_images(prompt=req.prompt, number_of_images=1)
-
-        if resp.images and hasattr(resp.images[0], "_image_bytes"):
-            img_bytes = resp.images[0]._image_bytes
-        else:
-            raise HTTPException(status_code=500, detail="Image generation failed")
-
-        output_dir = os.path.join(os.path.dirname(__file__), "generated_files", "images")
-        os.makedirs(output_dir, exist_ok=True)
-        filename = os.path.join(output_dir, f"generated_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-
-        with open(filename, "wb") as f:
-            f.write(img_bytes)
-
-        return FileResponse(filename, media_type="image/png", filename=os.path.basename(filename))
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image generation error: {e}")
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "text_model": TEXT_MODEL_NAME, "image_model": IMAGE_MODEL_NAME}
-
-@app.post("/edit-ppt-outline")
-def edit_ppt_outline(req: EditRequest):
-    outline_text = "\n".join(
-        [f"Slide {i+1}: {s.title}\n{s.description}" for i, s in enumerate(req.outline.slides)]
-    )
-    prompt = f"""
-    You are an assistant improving a PowerPoint outline.
-
-    Current Outline:
-    Title: {req.outline.title}
-    {outline_text}
-
-    Feedback:
-    {req.feedback}
-
-    Task:
-    - Apply the feedback to refine/improve the outline.
-    - Return the updated outline with the same format:
-      Slide 1: <Title>
-      - Bullet
-      - Bullet
-    - Do NOT add a title slide (I will handle it).
+    Create a Word Document with optional images.
+    sections: list of {"title": str, "description": str}
+    images: list of file paths or None (one per section)
     """
-    try:
-        updated_points = parse_points(call_vertex(prompt))
-        return {"title": req.outline.title, "slides": updated_points}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PPT outline editing failed: {e}")
+    doc = Document()
 
-@app.post("/edit-doc-outline")
-def edit_doc_outline(req: EditDocRequest):
-    outline_text = "\n".join(
-        [f"Section {i+1}: {s.title}\n{s.description}" for i, s in enumerate(req.outline.sections)]
-    )
-    prompt = f"""
-    You are an assistant improving a Document outline.
+    # --- Title Page ---
+    doc.add_heading(clean_title_text(title), level=0)
+    doc.add_paragraph()
 
-    Current Outline:
-    Title: {req.outline.title}
-    {outline_text}
+    # --- Content Sections ---
+    for idx, section in enumerate(sections, start=1):
+        sec_title = clean_title_text(section.get("title", f"Section {idx}"))
+        description = section.get("description", "")
 
-    Feedback:
-    {req.feedback}
+        # Section Heading
+        heading = doc.add_heading(sec_title, level=1)
+        heading.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
 
-    Task:
-    - Apply the feedback to refine/improve the outline.
-    - Return the updated outline with the same format:
-      Section 1: <Title>
-      <Paragraph 1>
-      <Paragraph 2>
-      <Paragraph 3>
-    - Avoid bullet points, use prose.
-    """
-    try:
-        updated_points = parse_points(call_vertex(prompt))
-        return {"title": req.outline.title, "sections": updated_points}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Doc outline editing failed: {e}")
+        # Section Content
+        for para in description.split("\n"):
+            if para.strip():
+                p = doc.add_paragraph(para.strip())
+                p.alignment = WD_PARAGRAPH_ALIGNMENT.JUSTIFY
+                run = p.runs[0]
+                run.font.size = Pt(11)
+
+        # Add Image if available
+        if images and idx - 1 < len(images) and images[idx - 1]:
+            try:
+                doc.add_paragraph()  # spacing before image
+                doc.add_picture(images[idx - 1], width=Inches(5.5))
+                last_paragraph = doc.paragraphs[-1]
+                last_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                doc.add_paragraph()  # spacing after image
+            except Exception as e:
+                print(f"⚠️ Failed to insert image for section {idx}: {e}")
+
+        doc.add_page_break()
+
+    doc.save(filename)
+    return filename
