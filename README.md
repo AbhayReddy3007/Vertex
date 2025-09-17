@@ -80,12 +80,16 @@ class ImageRequest(BaseModel):
 
 
 # ---------------- HELPERS ----------------
-def extract_slide_count(description: str, default: int = 5) -> int:
+def extract_slide_count(description: str, default: Optional[int] = None) -> Optional[int]:
+    """
+    Extracts slide/section count from user description if mentioned.
+    If no explicit number is found, returns None (AI will decide).
+    """
     m = re.search(r"(\d+)\s*(slides?|sections?|pages?)", description, re.IGNORECASE)
     if m:
         total = int(m.group(1))
-        return max(1, total - 1)
-    return default - 1
+        return max(1, total - 1)  # exclude title slide if it's a PPT
+    return None if default is None else default - 1
 
 def call_vertex(prompt: str) -> str:
     try:
@@ -174,9 +178,10 @@ def split_text(text: str, chunk_size: int = 8000, overlap: int = 300) -> List[st
         start = max(0, end - overlap)
     return chunks
 
-def generate_outline_from_desc(description: str, num_items: int, mode: str = "ppt"):
-    if mode == "ppt":
-        prompt = f"""Create a PowerPoint outline on: {description}.
+def generate_outline_from_desc(description: str, num_items: Optional[int], mode: str = "ppt"):
+    if num_items:
+        if mode == "ppt":
+            prompt = f"""Create a PowerPoint outline on: {description}.
 Generate exactly {num_items} content slides (⚠️ excluding the title slide).
 Do NOT include a title slide — I will handle it separately.
 Start from Slide 1 as the first *content slide*.
@@ -186,18 +191,41 @@ Slide 1: <Title>
 - Bullet
 - Bullet
 """
-    else:
-        prompt = f"""Create a detailed Document outline on: {description}.
+        else:
+            prompt = f"""Create a detailed Document outline on: {description}.
 Generate exactly {num_items} sections (treat each section as roughly one page).
 Each section should have:
 - A section title
-- 2–3 descriptive paragraphs (5–7 sentences each) of full prose, not bullets.
+- 2–3 descriptive paragraphs (5–7 sentences each).
 Do NOT use bullet points.
 Format strictly like this:
 Section 1: <Title>
 <Paragraph 1>
 <Paragraph 2>
 <Paragraph 3>
+"""
+    else:
+        if mode == "ppt":
+            prompt = f"""Create a PowerPoint outline on: {description}.
+Decide the most appropriate number of content slides (⚠️ excluding the title slide).
+Each slide should have a short title and 3–5 bullet points.
+Do NOT include a title slide — I will handle it separately.
+Format strictly like this:
+Slide 1: <Title>
+- Bullet
+- Bullet
+- Bullet
+"""
+        else:
+            prompt = f"""Create a detailed Document outline on: {description}.
+Decide the most appropriate number of sections (treat each section as roughly one page).
+Each section should have:
+- A section title
+- 2–3 descriptive paragraphs (5–7 sentences each).
+Do NOT use bullet points.
+Format strictly like this:
+Section 1: <Title>
+<Paragraphs...>
 """
     points_text = call_vertex(prompt)
     return parse_points(points_text)
@@ -291,7 +319,7 @@ async def upload(file: UploadFile = File(...)):
 @app.post("/generate-ppt-outline")
 def generate_ppt_outline(request: GeneratePPTRequest):
     title = generate_title(request.description)
-    num_content_slides = extract_slide_count(request.description, default=5)
+    num_content_slides = extract_slide_count(request.description, default=None)
     points = generate_outline_from_desc(request.description, num_content_slides, mode="ppt")
     return {"title": title, "slides": points}
 
@@ -302,7 +330,7 @@ def generate_ppt(req: GeneratePPTRequest):
         points = [{"title": clean_title(s.title), "description": s.description} for s in req.outline.slides]
     else:
         title = clean_title(generate_title(req.description))
-        num_content_slides = extract_slide_count(req.description, default=5)
+        num_content_slides = extract_slide_count(req.description, default=None)
         points = generate_outline_from_desc(req.description, num_content_slides, mode="ppt")
 
     images = generate_images_for_points(points, mode="ppt")
@@ -321,7 +349,7 @@ def generate_ppt(req: GeneratePPTRequest):
 @app.post("/generate-doc-outline")
 def generate_doc_outline(request: GenerateDocRequest):
     title = generate_title(request.description)
-    num_sections = extract_slide_count(request.description, default=5)
+    num_sections = extract_slide_count(request.description, default=None)
     points = generate_outline_from_desc(request.description, num_sections, mode="doc")
     return {"title": title, "sections": points}
 
@@ -332,7 +360,7 @@ def generate_doc(req: GenerateDocRequest):
         points = [{"title": clean_title(s.title), "description": s.description} for s in req.outline.sections]
     else:
         title = clean_title(generate_title(req.description))
-        num_sections = extract_slide_count(req.description, default=5)
+        num_sections = extract_slide_count(req.description, default=None)
         points = generate_outline_from_desc(req.description, num_sections, mode="doc")
 
     images = generate_images_for_points(points, mode="doc")
@@ -394,9 +422,6 @@ def health():
 
 @app.post("/edit-ppt-outline")
 def edit_ppt_outline(req: EditRequest):
-    """
-    Refine an existing PPT outline based on user feedback.
-    """
     outline_text = "\n".join(
         [f"Slide {i+1}: {s.title}\n{s.description}" for i, s in enumerate(req.outline.slides)]
     )
@@ -427,9 +452,6 @@ def edit_ppt_outline(req: EditRequest):
 
 @app.post("/edit-doc-outline")
 def edit_doc_outline(req: EditDocRequest):
-    """
-    Refine an existing Document outline based on user feedback.
-    """
     outline_text = "\n".join(
         [f"Section {i+1}: {s.title}\n{s.description}" for i, s in enumerate(req.outline.sections)]
     )
