@@ -81,14 +81,10 @@ class ImageRequest(BaseModel):
 
 # ---------------- HELPERS ----------------
 def extract_slide_count(description: str, default: Optional[int] = None) -> Optional[int]:
-    """
-    Extracts slide/section count from user description if mentioned.
-    If no explicit number is found, returns None (AI will decide).
-    """
     m = re.search(r"(\d+)\s*(slides?|sections?|pages?)", description, re.IGNORECASE)
     if m:
         total = int(m.group(1))
-        return max(1, total - 1)  # exclude title slide if it's a PPT
+        return max(1, total - 1)
     return None if default is None else default - 1
 
 def call_vertex(prompt: str) -> str:
@@ -257,30 +253,50 @@ def save_temp_image(image_bytes, idx, title):
         f.write(image_bytes)
     return filepath
 
+def should_generate_image(title: str, description: str) -> bool:
+    """
+    Ask Gemini if an image is needed for this slide/section.
+    """
+    prompt = f"""
+    You are helping to decide if a slide/section in a presentation/document needs an image.
+    Slide/Section Title: {title}
+    Content: {description}
+
+    Answer with only "YES" if an image/visual would significantly enhance understanding,
+    or "NO" if it does not add much value.
+    """
+    try:
+        decision = call_vertex(prompt).strip().upper()
+        return decision.startswith("Y")
+    except:
+        return False
+
 def generate_images_for_points(points, mode="ppt"):
-    """Generate one image per slide/section using Imagen."""
+    """Generate images only for slides/sections where it's useful."""
     images = []
     for idx, item in enumerate(points, start=1):
-        img_prompt = (
-            f"An illustration for a {mode.upper()} section titled '{item['title']}'. "
-            f"Content: {item['description']}. "
-            f"Style: professional, modern, clean, infographic look."
-        )
-        try:
-            resp = IMAGE_MODEL.generate_images(prompt=img_prompt, number_of_images=1)
+        if should_generate_image(item['title'], item['description']):
+            img_prompt = (
+                f"An illustration for a {mode.upper()} section titled '{item['title']}'. "
+                f"Content: {item['description']}. "
+                f"Style: professional, modern, clean, infographic look."
+            )
+            try:
+                resp = IMAGE_MODEL.generate_images(prompt=img_prompt, number_of_images=1)
+                if resp.images and hasattr(resp.images[0], "_image_bytes"):
+                    img_bytes = resp.images[0]._image_bytes
+                else:
+                    img_bytes = None
 
-            if resp.images and hasattr(resp.images[0], "_image_bytes"):
-                img_bytes = resp.images[0]._image_bytes
-            else:
-                img_bytes = None
-
-            if img_bytes:
-                img_path = save_temp_image(img_bytes, idx, item["title"])
-                images.append(img_path)
-            else:
+                if img_bytes:
+                    img_path = save_temp_image(img_bytes, idx, item["title"])
+                    images.append(img_path)
+                else:
+                    images.append(None)
+            except Exception as e:
+                print(f"⚠️ Image generation failed for {mode} {idx}: {e}")
                 images.append(None)
-        except Exception as e:
-            print(f"⚠️ Image generation failed for {mode} {idx}: {e}")
+        else:
             images.append(None)
     return images
 
@@ -448,7 +464,6 @@ def edit_ppt_outline(req: EditRequest):
         return {"title": req.outline.title, "slides": updated_points}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PPT outline editing failed: {e}")
-
 
 @app.post("/edit-doc-outline")
 def edit_doc_outline(req: EditDocRequest):
