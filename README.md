@@ -1,3 +1,59 @@
+This is my app.py
+import requests
+import streamlit as st
+
+BACKEND_URL = "http://127.0.0.1:8000"  # FastAPI backend URL
+
+st.set_page_config(page_title="AI Image Generator", layout="wide")
+st.title("🖼️ AI Image Generator")
+
+# ---------------- STATE ----------------
+if "generated_images" not in st.session_state:
+    st.session_state.generated_images = []
+
+# ---------------- UI ----------------
+prompt = st.text_area("✨ Enter your prompt to generate an image:", height=120)
+
+if st.button("🚀 Generate Image"):
+    if not prompt.strip():
+        st.warning("Please enter a prompt!")
+    else:
+        with st.spinner("Generating image..."):
+            try:
+                resp = requests.post(f"{BACKEND_URL}/generate-image", json={"prompt": prompt}, timeout=180)
+                if resp.status_code == 200:
+                    img_bytes = resp.content
+                    filename = resp.headers.get("content-disposition", "").split("filename=")[-1].strip('"') or "image.png"
+
+                    st.image(img_bytes, caption=filename, use_container_width=True)
+                    st.download_button(
+                        "⬇️ Download Image",
+                        data=img_bytes,
+                        file_name=filename,
+                        mime="image/png"
+                    )
+
+                    st.session_state.generated_images.append({"filename": filename, "content": img_bytes})
+
+                else:
+                    st.error(f"❌ Image generation failed: {resp.text}")
+            except Exception as e:
+                st.error(f"⚠️ Backend error: {e}")
+
+# ---------------- HISTORY ----------------
+if st.session_state.generated_images:
+    st.subheader("📂 Past Generated Images")
+    for i, img in enumerate(st.session_state.generated_images):
+        with st.expander(f"Image {i+1}: {img['filename']}"):
+            st.image(img["content"], caption=img["filename"], use_container_width=True)
+            st.download_button(
+                "⬇️ Download Again",
+                data=img["content"],
+                file_name=img["filename"],
+                mime="image/png",
+                key=f"download_img_{i}")
+
+This is my main.py
 #main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -58,60 +114,5 @@ def generate_image(req: ImageRequest):
 @app.get("/health")
 def health():
     return {"status": "ok", "image_model": IMAGE_MODEL_NAME}
-
-#app.py
-import requests
-import streamlit as st
-
-BACKEND_URL = "http://127.0.0.1:8000"  # FastAPI backend URL
-
-st.set_page_config(page_title="AI Image Generator", layout="wide")
-st.title("🖼️ AI Image Generator")
-
-# ---------------- STATE ----------------
-if "generated_images" not in st.session_state:
-    st.session_state.generated_images = []
-
-# ---------------- UI ----------------
-prompt = st.text_area("✨ Enter your prompt to generate an image:", height=120)
-
-if st.button("🚀 Generate Image"):
-    if not prompt.strip():
-        st.warning("Please enter a prompt!")
-    else:
-        with st.spinner("Generating image..."):
-            try:
-                resp = requests.post(f"{BACKEND_URL}/generate-image", json={"prompt": prompt}, timeout=180)
-                if resp.status_code == 200:
-                    img_bytes = resp.content
-                    filename = resp.headers.get("content-disposition", "").split("filename=")[-1].strip('"') or "image.png"
-
-                    st.image(img_bytes, caption=filename, use_container_width=True)
-                    st.download_button(
-                        "⬇️ Download Image",
-                        data=img_bytes,
-                        file_name=filename,
-                        mime="image/png"
-                    )
-
-                    st.session_state.generated_images.append({"filename": filename, "content": img_bytes})
-
-                else:
-                    st.error(f"❌ Image generation failed: {resp.text}")
-            except Exception as e:
-                st.error(f"⚠️ Backend error: {e}")
-
-# ---------------- HISTORY ----------------
-if st.session_state.generated_images:
-    st.subheader("📂 Past Generated Images")
-    for i, img in enumerate(st.session_state.generated_images):
-        with st.expander(f"Image {i+1}: {img['filename']}"):
-            st.image(img["content"], caption=img["filename"], use_container_width=True)
-            st.download_button(
-                "⬇️ Download Again",
-                data=img["content"],
-                file_name=img["filename"],
-                mime="image/png",
-                key=f"download_img_{i}"
-            )
+            
 
