@@ -9,14 +9,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# ✅ Vertex AI imports
+# ✅ Vertex AI imports (Imagen 4 needs non-preview)
 import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel
+from vertexai.vision_models import ImageGenerationModel
 
-# 🔹 Hardcoded Config (replace with your actual values)
-GCP_PROJECT = "my-project"   # e.g. "my-ai-project-123456"
+# 🔹 Config
+GCP_PROJECT = "my-project"   # replace with your project ID
 GCP_LOCATION = "us-central1"
-IMAGEN_MODEL = "imagen-3.0-generate-002"
+IMAGEN_MODEL = "imagen-4.0-generate-001"
 
 # 🔹 Validate GOOGLE_APPLICATION_CREDENTIALS env
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -81,8 +81,10 @@ def generate_image(req: GenerateRequest):
 
         images_out = []
         for img in result.images:
-            if hasattr(img, "image_bytes") and img.image_bytes:
-                b64 = base64.b64encode(img.image_bytes).decode("utf-8")
+            # Imagen 4 sometimes uses image_bytes, sometimes bytes_data depending on SDK
+            bdata = getattr(img, "image_bytes", None) or getattr(img, "bytes_data", None)
+            if bdata:
+                b64 = base64.b64encode(bdata).decode("utf-8")
                 images_out.append({"b64": b64, "mime": "image/png"})
 
         if not images_out:
@@ -95,11 +97,12 @@ def generate_image(req: GenerateRequest):
 
     except Exception as e:
         tb = traceback.format_exc()
-        print("🔥 Vertex AI Exception Traceback:\n", tb)  # log to console
+        print("🔥 Vertex AI Exception Traceback:\n", tb)
         raise HTTPException(
             status_code=500,
             detail=f"Vertex AI error: {e}\nTraceback:\n{tb}"
         )
+
 
 This is my app.py
 import streamlit as st
@@ -108,9 +111,9 @@ import base64
 
 # ✅ Page setup
 st.set_page_config(page_title="Imagen 4 Generator", layout="centered")
-st.title("Image Generator (Vertex AI - Imagen 4)")
+st.title("🖼️ Image Generator (Vertex AI - Imagen 4)")
 
-# ✅ Hardcoded backend URL
+# ✅ Hardcoded backend URL (FastAPI service must be running)
 BACKEND_URL = "http://127.0.0.1:8000"
 
 # ✅ Prompt input
@@ -160,6 +163,5 @@ if st.button("Generate"):
                         label=f"Download image {idx+1}",
                         data=img_bytes,
                         file_name=f"gen_image_{idx+1}.png",
-                        mime=mime,)
-
-
+                        mime=mime,
+                    )
